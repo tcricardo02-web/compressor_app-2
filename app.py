@@ -1,456 +1,287 @@
 import streamlit as st
-import logging
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-import pandas as pd
+import math
 import plotly.graph_objects as go
-import pint
-import io
-from datetime import datetime
 
-from sqlalchemy import create_engine, Column, Integer, Float, ForeignKey
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+# --- Configuração da Página ---
+st.set_page_config(
+    page_title="UniCompSim",
+    page_icon="🔩",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+# --- Funções de Cálculo (Motor da Simulação) ---
+def run_simulation(inputs):
+    """
+    Executa a simulação de desempenho do compressor com base nas entradas.
+    Esta é a versão em Python da lógica de cálculo do JavaScript.
+    """
+    i = inputs
 
-import tempfile
+    # 1. Propriedades do Gás (estimativa simplificada para gás natural típico)
+    molar_mass = (i['gas']['ch4'] * 16.04 + i['gas']['c2h6'] * 30.07 + i['gas']['c3h8'] * 44.1 + i['gas']['n2'] * 28.01) / 100
+    k = 1.28  # Razão de calores específicos (k), valor típico
+    z_avg = 0.95  # Fator de compressibilidade médio, valor típico
 
-# ------------------------------------------------------------------------------
-# Logger e Unidades
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-ureg = pint.UnitRegistry()
-Q_ = ureg.Quantity
+    # 2. Condições de Processo (conversão para unidades SI)
+    ps_abs = (i['op']['ps'] + 1.01325) * 1e5  # Pa
+    pd_abs = (i['op']['pd'] + 1.01325) * 1e5  # Pa
+    ts_abs = i['op']['ts'] + 273.15  # K
+    
+    if ps_abs == 0: return None # Evita divisão por zero
+    compression_ratio = pd_abs / ps_abs
 
-# ------------------------------------------------------------------------------
-# Sistema de Unidades
-# ------------------------------------------------------------------------------
-# O usuário pode escolher unidade para pressões, temperaturas e comprimentos.
-unit_options = {
-    "Opção 1": {"pressao": "psig", "temperatura": "°F", "comprimento": "polegadas"},
-    "Opção 2": {"pressao": "kgf/cm²", "temperatura": "°C", "comprimento": "mm"}
-}
+    # 3. Geometria do Cilindro
+    stroke_m = i['comp']['stroke'] / 1000
+    bore_m = i['cyl']['bore'] / 1000
+    rod_m = i['cyl']['rod'] / 1000
+    area_he = math.pi * (bore_m / 2)**2  # m^2
+    area_ce = area_he - (math.pi * (rod_m / 2)**2)  # m^2
+    displacement_he = area_he * stroke_m * (i['comp']['rpm'] / 60)  # m^3/s
+    displacement_ce = area_ce * stroke_m * (i['comp']['rpm'] / 60)  # m^3/s
 
-selected_unit = st.sidebar.radio("Selecione o sistema de unidades", list(unit_options.keys()))
-units = unit_options[selected_unit]
-st.sidebar.write(f"**Pressão:** {units['pressao']}, **Temperatura:** {units['temperatura']}, **Comprimento:** {units['comprimento']}")
+    # 4. Cálculos de Performance
+    vol_eff_he = 1 - (i['cyl']['clearanceHE'] / 100) * (compression_ratio**(1 / k) - 1)
+    vol_eff_ce = 1 - (i['cyl']['clearanceCE'] / 100) * (compression_ratio**(1 / k) - 1)
+    
+    # Garante que a eficiência volumétrica não seja negativa
+    vol_eff_he = max(0, vol_eff_he)
+    vol_eff_ce = max(0, vol_eff_ce)
 
-# ------------------------------------------------------------------------------
-# Banco de dados e modelos (exemplo, não utilizado para persistência neste app)
-# ------------------------------------------------------------------------------
-DB_PATH = "sqlite:///compressor.db"
-Base = declarative_base()
-engine = create_engine(DB_PATH, echo=False, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+    flow_m3s = (displacement_he * vol_eff_he) + (displacement_ce * vol_eff_ce)
+    
+    # Conversão de Vazão para MMSCFD (aproximado)
+    flow_mmscfd = flow_m3s * (ps_abs / 101325) * (288.7 / ts_abs) * (3600 * 24 / 0.0283168) / 1e6
 
-class FrameModel(Base):
-    __tablename__ = "frame"
-    id = Column(Integer, primary_key=True, index=True)
-    rpm = Column(Float)
-    stroke_m = Column(Float)
-    n_throws = Column(Integer)
-    throws = relationship("ThrowModel", back_populates="frame")
+    td_abs = ts_abs * compression_ratio**((k - 1) / (k * z_avg))
+    td_c = td_abs - 273.15
 
-class ThrowModel(Base):
-    __tablename__ = "throw"
-    id = Column(Integer, primary_key=True, index=True)
-    frame_id = Column(Integer, ForeignKey("frame.id"))
-    throw_number = Column(Integer)
-    bore_m = Column(Float)
-    clearance_m = Column(Float)
-    VVCP = Column(Float)
-    SACE = Column(Float)
-    SAHE = Column(Float)
+    gas_power_w = (ps_abs * flow_m3s * (k / (k - 1))) * (compression_ratio**((k - 1) / k) - 1) / z_avg if k > 1 else 0
+    
+    brake_power_kw = (gas_power_w * 1.10) / 1000
 
-    frame = relationship("FrameModel", back_populates="throws")
+    rod_load_comp = (pd_abs * area_ce) - (ps_abs * area_he)
+    rod_load_tens = (pd_abs * area_he) - (ps_abs * area_ce)
+    max_rod_load_kn = max(abs(rod_load_comp), abs(rod_load_tens)) / 1000
 
-class ActuatorModel(Base):
-    __tablename__ = "actuator"
-    id = Column(Integer, primary_key=True, index=True)
-    power_available_kW = Column(Float)
-    derate_percent = Column(Float)
-    air_cooler_fraction = Column(Float)
-
-def init_db():
-    Base.metadata.create_all(bind=engine)
-    logger.info("Banco de dados inicializado.")
-
-# ------------------------------------------------------------------------------
-# Dataclasses para cálculos
-# ------------------------------------------------------------------------------
-@dataclass
-class Frame:
-    rpm: float
-    stroke: float
-    n_cilindros: int  # renomeado para refletir a quantidade de cilindros
-
-@dataclass
-class Cilindro:
-    cilindro_num: int
-    stage: int
-    clearance_pct: float
-    SACE: float
-    VVCP_pct: float
-
-@dataclass
-class Actuator:
-    power_kW: float
-    derate_percent: float
-    air_cooler_fraction: float
-
-@dataclass
-class Motor:
-    type: str  # "Gás Natural" ou "Elétrico"
-    rpm: float
-    derate_percent: float
-    air_cooler_consumption_pct: float  # fixo em 4%
-
-# ------------------------------------------------------------------------------
-# Cálculos de performance (mantendo função original)
-# ------------------------------------------------------------------------------
-def clamp(n, a, b):
-    return max(a, min(n, b))
-
-def perform_performance_calculation(
-    mass_flow: float,
-    inlet_pressure: Q_,
-    inlet_temperature: Q_,
-    n_stages: int,
-    PR_total: float,
-    cilindros: List[Cilindro],
-    stage_mapping: Dict[int, List[int]],
-    actuator: Actuator,
-) -> Dict:
-    m_dot = mass_flow
-    P_in = inlet_pressure.to(ureg.Pa).magnitude
-    T_in = inlet_temperature.to(ureg.K).magnitude
-
-    n = max(n_stages, 1)
-    PR_base = PR_total ** (1.0 / n)
-
-    gamma = 1.30
-    cp = 2.0
-
-    stage_details = []
-    total_W_kW = 0.0
-    # Mapeia por número de cilindro
-    cilindros_por_num = {c.cilindro_num: c for c in cilindros}
-
-    for stage in range(1, n + 1):
-        P_in_stage = P_in * (PR_base ** (stage - 1))
-        P_out_stage = P_in_stage * PR_base
-
-        # Seleciona todos os cilindros designados para este estágio
-        assigned = stage_mapping.get(stage, [])
-        if assigned:
-            # Média dos parâmetros (só um exemplo, similar à função original)
-            clearance_avg = sum(cilindros_por_num[c].clearance_pct for c in assigned if c in cilindros_por_num) / len(assigned)
-            SACE_avg = sum(cilindros_por_num[c].SACE for c in assigned if c in cilindros_por_num) / len(assigned)
-            VVCP_avg = sum(cilindros_por_num[c].VVCP_pct for c in assigned if c in cilindros_por_num) / len(assigned)
-        else:
-            clearance_avg = SACE_avg = VVCP_avg = 0.0
-
-        eta_isent = 0.65 + 0.15 * (SACE_avg / 100.0) - 0.05 * (VVCP_avg / 100.0) + 0.10 * (clearance_avg / 100.0)
-        eta_isent = clamp(eta_isent, 0.65, 0.92)
-
-        T_out_isent = T_in * (PR_base ** ((gamma - 1.0) / gamma))
-        T_out_actual = T_in + (T_out_isent - T_in) / max(eta_isent, 1e-6)
-        delta_T = T_out_actual - T_in
-
-        W_stage = m_dot * cp * delta_T / 1000.0
-        total_W_kW += W_stage
-
-        stage_details.append({
-            "stage": stage,
-            "P_in_bar": P_in_stage / 1e5,
-            "P_out_bar": P_out_stage / 1e5,
-            "PR": PR_base,
-            "T_in_C": T_in - 273.15,
-            "T_out_C": T_out_actual - 273.15,
-            "isentropic_efficiency": eta_isent,
-            "shaft_power_kW": W_stage,
-            "shaft_power_BHP": W_stage * 1.34102
-        })
-
-        T_in = T_out_actual
-
-    return {
-        "mass_flow_kg_s": m_dot,
-        "inlet_pressure_bar": P_in / 1e5,
-        "inlet_temperature_C": inlet_temperature.to(ureg.degC).magnitude,
-        "n_stages": n_stages,
-        "total_shaft_power_kW": total_W_kW,
-        "total_shaft_power_BHP": total_W_kW * 1.34102,
-        "stage_details": stage_details
+    # --- Montagem do Objeto de Resultados ---
+    results = {
+        'power': brake_power_kw,
+        'power_perc': (brake_power_kw / i['comp']['powerLimit']) * 100 if i['comp']['powerLimit'] > 0 else 0,
+        'rod_load': max_rod_load_kn,
+        'rod_load_perc': (max_rod_load_kn / i['comp']['rodloadLimit']) * 100 if i['comp']['rodloadLimit'] > 0 else 0,
+        'flow': flow_mmscfd,
+        'flow_perc': (flow_mmscfd / i['op']['flowTarget']) * 100 if i['op']['flowTarget'] > 0 else 0,
+        'temp': td_c,
+        'pv_data': {
+            'ps': i['op']['ps'],
+            'pd': i['op']['pd'],
+            'clearance': i['cyl']['clearanceHE']
+        },
+        'rod_load_data': {
+            'comp': rod_load_comp / 1000,
+            'tens': rod_load_tens / 1000,
+            'limit': i['comp']['rodloadLimit']
+        }
     }
+    return results
 
-# ------------------------------------------------------------------------------
-# Função para gerar diagrama ilustrativo da configuração do equipamento
-# (semelhante ao Ariel 7)
-# ------------------------------------------------------------------------------
-def generate_config_diagram(motor: Motor, frame: Frame, cilindros: List[Cilindro]) -> go.Figure:
+# --- Funções de Gráfico ---
+def create_pv_chart(data):
+    """Gera um diagrama P-V teórico simplificado com Plotly."""
+    c = data['clearance'] / 100
+    k = 1.28
+    rc = (data['pd'] + 1.01325) / (data['ps'] + 1.01325) if (data['ps'] + 1.01325) > 0 else 1
+    
+    v_total = 1 + c
+    
+    # Pontos do ciclo
+    v_suc_end = v_total
+    p_suc = data['ps']
+    
+    v_comp_end = c
+    p_comp_end = data['pd']
+    
+    v_exp_start = c
+    p_exp_start = data['pd']
+
+    v_exp_end = c * (rc**(1/k))
+
+    # Curva de compressão
+    comp_v = [v_total * (1 - 0.01 * i) for i in range(101)]
+    comp_p = [p_suc * (v_total/v)**k for v in comp_v if v > c]
+    comp_v_filt = [v for v in comp_v if v > c]
+
+    # Curva de expansão
+    exp_v = [c * (1 + 0.01 * i * ((rc**(1/k))-1) ) for i in range(101)]
+    exp_p = [p_exp_start * (v_exp_start/v)**k for v in exp_v]
+
     fig = go.Figure()
-    width, height = 900, 350
+    # Adiciona as curvas
+    fig.add_trace(go.Scatter(x=[v_exp_end, v_total], y=[p_suc, p_suc], mode='lines', name='Sucção', line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=comp_v_filt, y=comp_p, mode='lines', name='Compressão', line=dict(color='red')))
+    fig.add_trace(go.Scatter(x=[c, c], y=[p_suc, p_comp_end], mode='lines', name='Descarga', line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=exp_v, y=exp_p, mode='lines', name='Expansão', line=dict(color='purple')))
 
-    # Diagrama Motor
-    fig.add_shape(type="rect", x0=30, y0=height/2-25, x1=130, y1=height/2+25,
-                  line=dict(color="MediumPurple"), fillcolor="Lavender")
-    fig.add_annotation(x=80, y=height/2,
-                       text=f"Motor<br>{motor.type}<br>RPM: {motor.rpm:.0f}",
-                       showarrow=False, font=dict(size=12), align="center")
-
-    # Diagrama Compressor (Frame)
-    f_x, f_y, f_w, f_h = 180, height/2-25, 200, 50
-    fig.add_shape(type="rect", x0=f_x, y0=f_y, x1=f_x+f_w, y1=f_y+f_h,
-                  line=dict(color="RoyalBlue"), fillcolor="LightSkyBlue")
-    fig.add_annotation(x=f_x+f_w/2, y=f_y+f_h/2,
-                       text=f"Compressor\nStroke: {frame.stroke}\nCilindros: {frame.n_cilindros}",
-                       showarrow=False, font=dict(size=12), align="center")
-    
-    # Diagrama para cada cilindro
-    n = len(cilindros)
-    if n > 0:
-        spacing = f_w / n
-        for c in cilindros:
-            idx = c.cilindro_num - 1
-            tx = f_x + idx*spacing + spacing/4
-            ty = f_y + f_h + 20
-            tw, th = spacing/2, 30
-            fig.add_shape(type="rect", x0=tx, y0=ty, x1=tx+tw, y1=ty+th,
-                          line=dict(color="DarkOrange"), fillcolor="Moccasin")
-            fig.add_annotation(x=tx+tw/2, y=ty+th/2,
-                               text=f"Cil {c.cilindro_num}\nEstágio: {c.stage}",
-                               showarrow=False, font=dict(size=10))
-    
-    # Diagrama Air Cooler
-    a_x, a_y, a_w, a_h = f_x+f_w+50, height/2-20, 120, 60
-    fig.add_shape(type="rect", x0=a_x, y0=a_y, x1=a_x+a_w, y1=a_y+a_h,
-                  line=dict(color="SaddleBrown"), fillcolor="PeachPuff")
-    fig.add_annotation(x=a_x+a_w/2, y=a_y+a_h/2,
-                       text="Air Cooler\nPerda: 1% por estágio\nSaída: 120°F",
-                       showarrow=False, font=dict(size=12), align="center")
-
-    fig.update_layout(width=width, height=height,
-                      margin=dict(l=20, r=20, t=20, b=20),
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
+    fig.update_layout(
+        title='Diagrama P-V (Teórico)',
+        xaxis_title='Volume (relativo)',
+        yaxis_title='Pressão (barg)',
+        showlegend=False,
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
     return fig
 
-# ------------------------------------------------------------------------------
-# Função para gerar fluxograma (PFD) do processo
-# ------------------------------------------------------------------------------
-def generate_process_flow_diagram() -> go.Figure:
+
+def create_rod_load_chart(data):
+    """Gera um gráfico de carga na haste senoidal simplificado com Plotly."""
+    angles = list(range(0, 361, 10))
+    load_gas = [(data['tens'] + data['comp'])/2 + (data['tens'] - data['comp'])/2 * math.cos(math.radians(a)) for a in angles]
+    
     fig = go.Figure()
-    width, height = 900, 350
-
-    # Bloco Compressor
-    fig.add_shape(type="rect", x0=50, y0=50, x1=250, y1=150,
-                  line=dict(color="RoyalBlue"), fillcolor="LightSkyBlue")
-    fig.add_annotation(x=150, y=100,
-                       text="Compressor",
-                       showarrow=False, font=dict(size=14))
-
-    # Bloco Air Cooler
-    fig.add_shape(type="rect", x0=300, y0=50, x1=500, y1=150,
-                  line=dict(color="SaddleBrown"), fillcolor="PeachPuff")
-    fig.add_annotation(x=400, y=100,
-                       text="Air Cooler\n(1% perda por estágio)\nSaída 120°F",
-                       showarrow=False, font=dict(size=14))
-
-    # Conexão entre Compressor e Air Cooler
-    fig.add_annotation(x=275, y=100, text="Fluxo de Gás", showarrow=True,
-                       arrowhead=2, ax=-20, ay=0)
-
-    fig.update_layout(width=width, height=height,
-                      margin=dict(l=20, r=20, t=20, b=20),
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
+    fig.add_trace(go.Scatter(x=angles, y=load_gas, mode='lines', name='Carga de Gás', line=dict(color='rgb(79, 70, 229)')))
+    
+    # Linhas de limite
+    fig.add_hline(y=data['limit'], line_dash="dash", line_color="red", annotation_text="Limite Tensão")
+    fig.add_hline(y=-data['limit'], line_dash="dash", line_color="red", annotation_text="Limite Compressão")
+    
+    fig.update_layout(
+        title='Carga na Haste (Teórico)',
+        xaxis_title='Ângulo do Virabrequim (°)',
+        yaxis_title='Carga na Haste (kN)',
+        showlegend=True,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
     return fig
 
-# ------------------------------------------------------------------------------
-# Exporta PDF (mantém função original)
-# ------------------------------------------------------------------------------
-def export_to_pdf(results: Dict, fig: go.Figure) -> bytes:
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    elements = []
-    styles = getSampleStyleSheet()
-    title_style = styles["Heading1"]
-    normal = styles["Normal"]
 
-    elements.append(Paragraph("<b>[LOGO AQUI]</b>", styles["Title"]))
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("Relatório de Performance do Compressor", title_style))
-    elements.append(Spacer(1, 12))
+# --- Interface do Usuário (UI) ---
+st.sidebar.title("UniCompSim")
+st.sidebar.markdown("### Configuração da Simulação")
 
-    summary = [
-        ["Massa (kg/s)", f"{results['mass_flow_kg_s']:.2f}"],
-        ["Pressão In (bar)", f"{results['inlet_pressure_bar']:.2f}"],
-        ["Temp In (°C)", f"{results['inlet_temperature_C']:.2f}"],
-        ["Estágios", f"{results['n_stages']}"],
-        ["Potência Total (kW)", f"{results['total_shaft_power_kW']:.2f}"],
-        ["Potência Total (BHP)", f"{results['total_shaft_power_BHP']:.2f}"]
-    ]
-    table = Table(summary)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
-    ]))
-    elements.append(table)
-    elements.append(Spacer(1, 12))
+inputs = {}
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
-        fig.write_image(tmpfile.name, format="png")
-        elements.append(PDFImage(tmpfile.name, width=400, height=160))
-        elements.append(Spacer(1, 12))
+# Módulo 1: Propriedades do Gás
+with st.sidebar.expander("📥 1. Propriedades do Gás", expanded=True):
+    st.markdown("Composição do Gás (Fração Molar %)")
+    c1, c2 = st.columns(2)
+    inputs_gas = {
+        'ch4': c1.number_input("Metano (CH4)", value=85.0, min_value=0.0, max_value=100.0, step=1.0),
+        'c2h6': c2.number_input("Etano (C2H6)", value=10.0, min_value=0.0, max_value=100.0, step=1.0),
+        'c3h8': c1.number_input("Propano (C3H8)", value=5.0, min_value=0.0, max_value=100.0, step=1.0),
+        'n2': c2.number_input("Nitrogênio (N2)", value=0.0, min_value=0.0, max_value=100.0, step=1.0),
+    }
+    inputs['gas'] = inputs_gas
+    
+# Módulo 2: Condições de Operação
+with st.sidebar.expander("⚙️ 2. Condições de Operação", expanded=True):
+    c1, c2 = st.columns(2)
+    inputs_op = {
+        'ps': c1.number_input("Pressão Sucção (barg)", value=20.0, step=1.0),
+        'ts': c2.number_input("Temp. Sucção (°C)", value=30.0, step=1.0),
+        'pd': c1.number_input("Pressão Descarga (barg)", value=60.0, step=1.0),
+        'flowTarget': c2.number_input("Vazão Requerida (MMSCFD)", value=15.0, step=1.0),
+    }
+    inputs['op'] = inputs_op
 
-    data = [["Estágio", "P_in (bar)", "P_out (bar)", "PR", "T_in (°C)", "T_out (°C)", "Eficiência", "Potência (kW)"]]
-    for s in results["stage_details"]:
-        data.append([
-            s["stage"], f"{s['P_in_bar']:.2f}", f"{s['P_out_bar']:.2f}", f"{s['PR']:.2f}",
-            f"{s['T_in_C']:.1f}", f"{s['T_out_C']:.1f}", f"{s['isentropic_efficiency']:.2f}", f"{s['shaft_power_kW']:.2f}"
-        ])
-    stage_table = Table(data)
-    stage_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
-    ]))
-    elements.append(stage_table)
-    elements.append(Spacer(1, 24))
+# Módulo 3: Configuração do Compressor
+with st.sidebar.expander("🔩 3. Configuração do Compressor", expanded=True):
+    st.markdown("**Frame:**")
+    c1, c2 = st.columns(2)
+    inputs_comp = {
+        'stroke': c1.number_input("Curso (mm)", value=150.0, step=1.0),
+        'rpm': c2.number_input("RPM", value=1200, step=10),
+        'rodloadLimit': c1.number_input("Carga Haste Máx (kN)", value=250.0, step=1.0),
+        'powerLimit': c2.number_input("Potência Frame Máx (kW)", value=1000.0, step=10.0),
+    }
+    inputs['comp'] = inputs_comp
 
-    footer = f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} por CompressorCalc"
-    elements.append(Paragraph(footer, normal))
-    doc.build(elements)
-    pdf = buffer.getvalue()
-    buffer.close()
-    return pdf
+    st.markdown("**Cilindro (1º Estágio):**")
+    c1, c2 = st.columns(2)
+    inputs_cyl = {
+        'bore': c1.number_input("Diâmetro Cil. (mm)", value=200.0, step=1.0),
+        'rod': c2.number_input("Diâmetro Haste (mm)", value=50.0, step=1.0),
+        'clearanceHE': c1.number_input("Folga Fixa HE (%)", value=15.0, step=0.5),
+        'clearanceCE': c2.number_input("Folga Fixa CE (%)", value=15.0, step=0.5),
+    }
+    inputs['cyl'] = inputs_cyl
 
-# ------------------------------------------------------------------------------
-# Streamlit App com múltiplas abas
-# ------------------------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="Calculadora de Performance de Compressor", layout="wide")
-    st.title("Calculadora de Performance de Compressor (Estilo Ariel 7)")
+# Botão de Simulação
+simulate_btn = st.sidebar.button("Simular Desempenho", type="primary", use_container_width=True)
 
-    init_db()
+# --- Área de Exibição Principal ---
+st.title("Resultados da Simulação")
 
-    # Uso de abas para separar funcionalidades
-    tab_perf, tab_config, tab_processo = st.tabs(["Cálculo de Performance", "Configuração do Equipamento", "Processo"])
+if simulate_btn:
+    results = run_simulation(inputs)
+    if results:
+        # Painel de Resumo
+        st.subheader("Painel de Resumo")
+        
+        def get_metric_color_help(percentage, limit=100):
+            if percentage >= limit:
+                return "error", "Limite excedido!"
+            elif percentage > (limit * 0.9):
+                return "warning", "Próximo ao limite."
+            else:
+                return "normal", "Dentro do limite."
 
-    # Aba de Configuração do Equipamento
-    with tab_config:
-        st.header("Configuração do Equipamento")
-        st.subheader("Motor")
-        motor_type = st.selectbox("Tipo de Motor", options=["Gás Natural", "Elétrico"])
-        motor_rpm = st.number_input("RPM do Motor", value=900)
-        motor_derate = st.number_input("Derate (%)", value=0.0)
-        # Potência consumida pelo Air Cooler fixada em 4%
-        air_cooler_consumption = st.number_input("Potência consumida pelo Air Cooler (% do motor)", value=4.0)
-
-        motor = Motor(type=motor_type, rpm=motor_rpm, derate_percent=motor_derate, air_cooler_consumption_pct=air_cooler_consumption)
-
-        st.subheader("Air Cooler")
-        st.info("Air Cooler: Perda de carga de 1% por estágio, temperatura de saída fixa de 120°F por estágio de resfriamento.")
-
-        st.subheader("Compressor")
-        compressor_stroke = st.number_input(f"Stroke (em {units['comprimento']})", value=0.2)
-        n_cilindros = st.number_input("Número de Cilindros", value=2, min_value=1, step=1)
-
-        # Prepara os dados para cada cilindro
-        cilindro_data = []
-        for i in range(1, n_cilindros+1):
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                stage = st.number_input(f"Cil {i} - Estágio", min_value=1, step=1, key=f"cil_stage_{i}")
-            with col2:
-                clearance = st.number_input(f"Cil {i} - Clearance (%)", value=5.0, key=f"cil_clearance_{i}")
-            with col3:
-                sace = st.number_input(f"Cil {i} - SACE", value=5.0, key=f"cil_sace_{i}")
-            with col4:
-                vvcp = st.number_input(f"Cil {i} - VVCP (%)", value=5.0, key=f"cil_vvcp_{i}")
-            with col5:
-                st.write(" ")  # espaço
-            cilindro_data.append({
-                "cilindro_num": i,
-                "stage": int(stage),
-                "clearance_pct": float(clearance),
-                "SACE": float(sace),
-                "VVCP_pct": float(vvcp)
-            })
-        cilindros = [Cilindro(**data) for data in cilindro_data]
-
-        # Diagrama ilustrativo da configuração do equipamento
-        st.subheader("Diagrama de Configuração do Equipamento")
-        config_fig = generate_config_diagram(motor, Frame(rpm=motor_rpm, stroke=compressor_stroke, n_cilindros=n_cilindros), cilindros)
-        st.plotly_chart(config_fig, use_container_width=True)
-
-    # Aba de Cálculo de Performance
-    with tab_perf:
-        st.header("Cálculo de Performance")
-        mass_flow = st.number_input("Massa de entrada (kg/s)", value=10.0)
-        # Para a pressão e temperatura de entrada, assumindo que se fornece em bar e °C; converter se necessário
-        inlet_pressure = st.number_input("Pressão de entrada (bar)", value=1.0)
-        inlet_temp = st.number_input("Temperatura de entrada (°C)", value=25.0)
-        n_stages = st.number_input("Número de Estágios", value=2, min_value=1, step=1)
-        PR_total = st.number_input("Relação de Pressão Total", value=4.0)
-
-        # Mapeia os cilindros para os estágios (podem ser mais de um cilindro por estágio)
-        stage_mapping = {}
-        for c in cilindros:
-            stage_mapping.setdefault(c.stage, []).append(c.cilindro_num)
-
-        actuator = Actuator(power_kW=mass_flow, derate_percent=0.0, air_cooler_fraction=0.1)  # exemplo simples
-        if st.button("Calcular Performance"):
-            results = perform_performance_calculation(
-                mass_flow,
-                Q_(inlet_pressure, ureg.bar),
-                Q_(inlet_temp, ureg.degC),
-                int(n_stages),
-                PR_total,
-                cilindros,
-                stage_mapping,
-                actuator,
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            color, help_text = get_metric_color_help(results['power_perc'])
+            st.metric(
+                label="Potência Requerida", 
+                value=f"{results['power']:.1f} kW", 
+                delta=f"{results['power_perc']:.1f}% do limite", 
+                delta_color=color,
+                help=help_text
             )
-            st.subheader("Resultados")
-            st.json(results)
-            # Diagrama original de performance (mantido ou adaptado se necessário)
-            perf_fig = generate_config_diagram(motor, Frame(rpm=motor_rpm, stroke=compressor_stroke, n_cilindros=n_cilindros), cilindros)
-            st.plotly_chart(perf_fig, use_container_width=True)
-            df_results = pd.DataFrame(results["stage_details"])
-            st.dataframe(df_results)
-
-            # Downloads
-            csv = df_results.to_csv(index=False).encode('utf-8')
-            st.download_button("⬇️ Baixar CSV", csv, "resultados.csv", "text/csv")
-            xlsx_buffer = io.BytesIO()
-            with pd.ExcelWriter(xlsx_buffer, engine="xlsxwriter") as writer:
-                df_results.to_excel(writer, index=False)
-            st.download_button("⬇️ Baixar Excel", xlsx_buffer.getvalue(), "resultados.xlsx")
-            pdf_bytes = export_to_pdf(results, perf_fig)
-            st.download_button(
-                label="⬇️ Baixar PDF",
-                data=pdf_bytes,
-                file_name="relatorio_compressor.pdf",
-                mime="application/pdf"
+        with col2:
+            color, help_text = get_metric_color_help(results['rod_load_perc'])
+            st.metric(
+                label="Carga Máx. na Haste", 
+                value=f"{results['rod_load']:.1f} kN", 
+                delta=f"{results['rod_load_perc']:.1f}% do limite", 
+                delta_color=color,
+                help=help_text
             )
+        with col3:
+            st.metric(
+                label="Vazão Calculada", 
+                value=f"{results['flow']:.2f} MMSCFD",
+                delta=f"{results['flow_perc']:.1f}% da meta",
+                delta_color="off"
+            )
+        with col4:
+            color, help_text = get_metric_color_help(results['temp'], limit=150)
+            st.metric(
+                label="Temp. de Descarga", 
+                value=f"{results['temp']:.1f} °C",
+                help=f"Limite de referência: 150 °C. {help_text}"
+            )
+            
+        st.divider()
 
-    # Aba de Processo (PFD)
-    with tab_processo:
-        st.header("Fluxograma do Processo - Compressor e Air Cooler")
-        pfd_fig = generate_process_flow_diagram()
-        st.plotly_chart(pfd_fig, use_container_width=True)
-        st.markdown("""
-        **Legenda:**
-        - **Compressor:** Compressão dos gases.
-        - **Air Cooler:** Resfriamento com perda de carga de 1% por estágio e saída fixada em 120°F.
-        - **Fluxo de Gás:** Representada pela seta entre os blocos.
-        """)
+        # Gráficos
+        st.subheader("Gráficos Interativos")
+        gcol1, gcol2 = st.columns(2)
+        with gcol1:
+            pv_fig = create_pv_chart(results['pv_data'])
+            st.plotly_chart(pv_fig, use_container_width=True)
+        with gcol2:
+            rodload_fig = create_rod_load_chart(results['rod_load_data'])
+            st.plotly_chart(rodload_fig, use_container_width=True)
+            
+    else:
+        st.error("Erro na simulação. Verifique se a pressão de sucção não é zero.")
 
-if __name__ == "__main__":
-    main()
+else:
+    st.info("Preencha os dados de configuração na barra lateral e clique em 'Simular' para ver os resultados.")
+    st.markdown("---")
+    st.image("https://images.unsplash.com/photo-1614275113714-a8a9a4561081?q=80&w=1932&auto=format&fit=crop", 
+             caption="[Imagem de um compressor industrial]",
+             use_column_width=True)
+
+
