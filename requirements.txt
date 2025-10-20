@@ -1,7 +1,1 @@
-streamlit
-pandas
-plotly
-pint
-SQLAlchemy
-reportlab
-XlsxWriter
+streamlitplotly
